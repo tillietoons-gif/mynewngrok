@@ -1,0 +1,274 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # ------------------------------------------------------------
+      # Configure Windows Remote Desktop
+      # ------------------------------------------------------------
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Write-Host "Configuring Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Inbound" | Out-Null
+          netsh advfirewall firewall add rule `
+            name="RDP-Inbound" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          Restart-Service -Name TermService -Force
+
+          Write-Host "Remote Desktop configured successfully."
+
+      # ------------------------------------------------------------
+      # Create RDP User
+      # ------------------------------------------------------------
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          Write-Host "Creating RDP user..."
+
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = (
+              [char[]](33..47) +
+              [char[]](58..64) +
+              [char[]](91..96) +
+              [char[]](123..126)
+            )
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+            Write-Host "Existing RDP user found. Removing it..."
+            Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -Description "GitHub Actions RDP user"
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "RDP user creation failed."
+            exit 1
+          }
+
+          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "             RDP CREDENTIALS"
+          Write-Host "=========================================="
+          Write-Host "Username: RDP"
+          Write-Host "Password: $password"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      # ------------------------------------------------------------
+      # Install bore tunnel
+      # ------------------------------------------------------------
+      - name: Install bore tunnel
+        shell: pwsh
+        run: |
+          Write-Host "Installing bore via cargo..."
+
+          # Install bore CLI from cargo
+          cargo install bore-cli 2>&1 | Out-Null
+
+          $borePath = Join-Path $env:USERPROFILE ".cargo\bin\bore.exe"
+
+          if (-not (Test-Path $borePath)) {
+            Write-Error "bore installation failed."
+            exit 1
+          }
+
+          Write-Host "bore installed at: $borePath"
+          "BORE_EXE=$borePath" >> $env:GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # Start Tunnel + Keep Runner Alive (single step so process survives)
+      # ------------------------------------------------------------
+      - name: Start Tunnel and Maintain Connection
+        shell: pwsh
+        run: |
+          $borePath = $env:BORE_EXE
+
+          if (-not (Test-Path $borePath)) {
+            Write-Error "bore executable not found."
+            exit 1
+          }
+
+          Write-Host "Starting bore TCP tunnel on port 3389..."
+
+          # Start bore as a background job in THIS shell session
+          $boreJob = Start-Process `
+            -FilePath $borePath `
+            -ArgumentList "local", "3389", "--to", "bore.pub" `
+            -RedirectStandardOutput "bore.log" `
+            -RedirectStandardError "bore-err.log" `
+            -PassThru
+
+          Write-Host "bore PID: $($boreJob.Id)"
+
+          # Wait for bore to establish tunnel
+          $boreAddress = $null
+
+          for ($retry = 1; $retry -le 30; $retry++) {
+            Start-Sleep -Seconds 2
+
+            $logFiles = @("bore.log", "bore-err.log")
+            foreach ($logFile in $logFiles) {
+              if (Test-Path $logFile) {
+                $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                  if ($content -match "listening at ([\w\.\-]+):(\d+)") {
+                    $boreAddress = "$($matches[1]):$($matches[2])"
+                    break
+                  }
+                  if ($content -match "remote at ([\w\.\-]+):(\d+)") {
+                    $boreAddress = "$($matches[1]):$($matches[2])"
+                    break
+                  }
+                  if ($content -match "bore\.pub[^\d]*(\d{4,5})") {
+                    $boreAddress = "bore.pub:$($matches[1])"
+                    break
+                  }
+                }
+              }
+            }
+
+            if ($boreAddress) { break }
+
+            # Check if process already died
+            $alive = Get-Process -Id $boreJob.Id -ErrorAction SilentlyContinue
+            if (-not $alive) {
+              Write-Host "bore process exited early. Logs:"
+              if (Test-Path "bore.log") { Get-Content "bore.log" }
+              if (Test-Path "bore-err.log") { Get-Content "bore-err.log" }
+
+              Write-Host "Retrying bore..."
+              $boreJob = Start-Process `
+                -FilePath $borePath `
+                -ArgumentList "local", "3389", "--to", "bore.pub" `
+                -RedirectStandardOutput "bore.log" `
+                -RedirectStandardError "bore-err.log" `
+                -PassThru
+              Start-Sleep -Seconds 3
+            }
+
+            Write-Host "Waiting for bore tunnel... attempt $retry/30"
+          }
+
+          if (-not $boreAddress) {
+            Write-Error "Could not determine bore tunnel address."
+            Write-Host "Full bore log:"
+            if (Test-Path "bore.log") { Get-Content "bore.log" }
+            Write-Host "Full bore error log:"
+            if (Test-Path "bore-err.log") { Get-Content "bore-err.log" }
+            exit 1
+          }
+
+          # Verify RDP is listening
+          $testResult = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 not accessible locally."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "             RDP ACCESS READY"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "  Address:  $boreAddress"
+          Write-Host "  Username: $env:RDP_USERNAME"
+          Write-Host "  Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "  No VPN, no paid accounts, no apps needed!"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          # Keep-alive loop â bore runs in THIS shell so it stays alive
+          while ($true) {
+            $alive = Get-Process -Id $boreJob.Id -ErrorAction SilentlyContinue
+
+            if (-not $alive) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] bore died, restarting..."
+
+              $boreJob = Start-Process `
+                -FilePath $borePath `
+                -ArgumentList "local", "3389", "--to", "bore.pub" `
+                -RedirectStandardOutput "bore.log" `
+                -RedirectStandardError "bore-err.log" `
+                -PassThru
+
+              # Re-read address
+              Start-Sleep -Seconds 5
+              $newAddr = $null
+              foreach ($logFile in @("bore.log", "bore-err.log")) {
+                if (Test-Path $logFile) {
+                  $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                  if ($content -and $content -match "listening at ([\w\.\-]+):(\d+)") {
+                    $newAddr = "$($matches[1]):$($matches[2])"
+                    break
+                  }
+                }
+              }
+              if ($newAddr) {
+                $boreAddress = $newAddr
+                Write-Host "Reconnected! New address: $boreAddress"
+              } else {
+                Write-Host "Reconnected but could not parse new address. Check logs."
+              }
+            }
+
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - $boreAddress"
+            Start-Sleep -Seconds 60
+          }
