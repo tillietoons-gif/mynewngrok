@@ -78,7 +78,7 @@ jobs:
           Write-Host "=========================================="
 
       # ------------------------------------------------------------
-      # 3. Install & Start ngrok Tunnel
+      # 3. Install & Start ngrok Tunnel via Local API
       # ------------------------------------------------------------
       - name: Start ngrok TCP Tunnel
         shell: pwsh
@@ -106,22 +106,35 @@ jobs:
 
           $ngrokAddress = $null
 
-          # Poll for tunnel address
-          for ($i = 1; $i -le 20; $i++) {
+          # Poll ngrok's local REST API directly (port 4040)
+          for ($i = 1; $i -le 30; $i++) {
             Start-Sleep -Seconds 2
-            if (Test-Path "ngrok.log") {
-              $logContent = Get-Content "ngrok.log" -Raw -ErrorAction SilentlyContinue
-              if ($logContent -match "url=tcp://([^:\s]+:\d+)") {
-                $ngrokAddress = $matches[1]
+
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 2 -ErrorAction Stop
+              if ($response.tunnels -and $response.tunnels.Count -gt 0) {
+                # Format: tcp://0.tcp.ngrok.io:12345 -> 0.tcp.ngrok.io:12345
+                $ngrokAddress = $response.tunnels[0].public_url -replace "tcp://", ""
                 break
               }
+            } catch {
+              # API still coming up
+            }
+
+            # If the process crashed, exit early
+            if ($ngrokJob.HasExited) {
+              Write-Host "ngrok process stopped unexpectedly."
+              break
             }
           }
 
+          # Handle connection failures and print detailed logs
           if (-not $ngrokAddress) {
             Write-Error "Failed to retrieve ngrok public address."
-            Get-Content "ngrok.log" -ErrorAction SilentlyContinue
-            Get-Content "ngrok-err.log" -ErrorAction SilentlyContinue
+            Write-Host "`n--- NGROK LOG DUMP ---"
+            if (Test-Path "ngrok.log") { Get-Content "ngrok.log" | Write-Host }
+            if (Test-Path "ngrok-err.log") { Get-Content "ngrok-err.log" | Write-Host }
+            Write-Host "----------------------`n"
             exit 1
           }
 
@@ -135,11 +148,10 @@ jobs:
           Write-Host "=========================================="
           Write-Host ""
 
-          # Keep-alive monitor
+          # Keep runner alive
           while ($true) {
-            $alive = Get-Process -Id $ngrokJob.Id -ErrorAction SilentlyContinue
-            if (-not $alive) {
-              Write-Host "Tunnel process died. Re-initializing..."
+            if ($ngrokJob.HasExited) {
+              Write-Host "ngrok died. Restarting..."
               $ngrokJob = Start-Process `
                 -FilePath "ngrok" `
                 -ArgumentList "tcp", "3389", "--log=stdout" `
