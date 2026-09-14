@@ -17,8 +17,12 @@ jobs:
         run: |
           Write-Host "Disabling heavy background services to eliminate input lag..."
           Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-          Stop-Service -Name SysMain, WSearch -Force -ErrorAction SilentlyContinue
-          Set-Service -Name SysMain, WSearch -StartupType Disabled -ErrorAction SilentlyContinue
+
+          # Iterate services individually to prevent parameter array binding errors
+          @('SysMain', 'WSearch') | ForEach-Object {
+            Stop-Service -Name $_ -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $_ -StartupType Disabled -ErrorAction SilentlyContinue
+          }
 
           Write-Host "Enabling Remote Desktop..."
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
