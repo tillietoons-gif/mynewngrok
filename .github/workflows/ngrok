@@ -1,0 +1,147 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Strip Bloat & Tune RDP for Maximum Frame Rate
+      # ------------------------------------------------------------
+      - name: Configure Core RDP and Performance Settings
+        shell: pwsh
+        run: |
+          Write-Host "Disabling heavy background services to eliminate input lag..."
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Stop-Service -Name SysMain, WSearch -Force -ErrorAction SilentlyContinue
+          Set-Service -Name SysMain, WSearch -StartupType Disabled -ErrorAction SilentlyContinue
+
+          Write-Host "Enabling Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 1 -Force
+
+          # Disable device redirections to reduce packet overhead
+          $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (-not (Test-Path $tsPolicyPath)) { New-Item -Path $tsPolicyPath -Force | Out-Null }
+          Set-ItemProperty -Path $tsPolicyPath -Name "fDisableCcm" -Value 1 -Force
+          Set-ItemProperty -Path $tsPolicyPath -Name "fDisableLPT" -Value 1 -Force
+          Set-ItemProperty -Path $tsPolicyPath -Name "MinCompressionSize" -Value 1 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Inbound" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Inbound" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      # ------------------------------------------------------------
+      # 2. Create User Credentials
+      # ------------------------------------------------------------
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]](35..38) + [char[]](48..57)
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($existingUser) { Remove-LocalUser -Name "RDP" }
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -Description "GitHub Actions RDP user"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "=========================================="
+          Write-Host "Username: RDP"
+          Write-Host "Password: $password"
+          Write-Host "=========================================="
+
+      # ------------------------------------------------------------
+      # 3. Install & Start ngrok Tunnel
+      # ------------------------------------------------------------
+      - name: Start ngrok TCP Tunnel
+        shell: pwsh
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          if (-not $env:NGROK_TOKEN) {
+            Write-Error "NGROK_AUTH_TOKEN secret is missing from repository settings."
+            exit 1
+          }
+
+          Write-Host "Installing ngrok..."
+          choco install ngrok -y --no-progress | Out-Null
+
+          Write-Host "Configuring auth token..."
+          ngrok config add-authtoken $env:NGROK_TOKEN
+
+          Write-Host "Starting ngrok tunnel on port 3389..."
+          $ngrokJob = Start-Process `
+            -FilePath "ngrok" `
+            -ArgumentList "tcp", "3389", "--log=stdout" `
+            -RedirectStandardOutput "ngrok.log" `
+            -RedirectStandardError "ngrok-err.log" `
+            -PassThru
+
+          $ngrokAddress = $null
+
+          # Poll for tunnel address
+          for ($i = 1; $i -le 20; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path "ngrok.log") {
+              $logContent = Get-Content "ngrok.log" -Raw -ErrorAction SilentlyContinue
+              if ($logContent -match "url=tcp://([^:\s]+:\d+)") {
+                $ngrokAddress = $matches[1]
+                break
+              }
+            }
+          }
+
+          if (-not $ngrokAddress) {
+            Write-Error "Failed to retrieve ngrok public address."
+            Get-Content "ngrok.log" -ErrorAction SilentlyContinue
+            Get-Content "ngrok-err.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "             RDP READY"
+          Write-Host "=========================================="
+          Write-Host "  Address:  $ngrokAddress"
+          Write-Host "  Username: $env:RDP_USERNAME"
+          Write-Host "  Password: $env:RDP_PASSWORD"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          # Keep-alive monitor
+          while ($true) {
+            $alive = Get-Process -Id $ngrokJob.Id -ErrorAction SilentlyContinue
+            if (-not $alive) {
+              Write-Host "Tunnel process died. Re-initializing..."
+              $ngrokJob = Start-Process `
+                -FilePath "ngrok" `
+                -ArgumentList "tcp", "3389", "--log=stdout" `
+                -RedirectStandardOutput "ngrok.log" `
+                -RedirectStandardError "ngrok-err.log" `
+                -PassThru
+            }
+            Start-Sleep -Seconds 30
+          }
