@@ -10,7 +10,7 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # 1. Strip Bloat & Tune RDP for Maximum Performance
+      # 1. Strip Bloat & Tune RDP for Maximum Frame Rate
       # ------------------------------------------------------------
       - name: Configure Core RDP and Performance Settings
         shell: pwsh
@@ -78,87 +78,71 @@ jobs:
           Write-Host "=========================================="
 
       # ------------------------------------------------------------
-      # 3. Fast-Download Pre-built Binary (No Cargo Compilation)
+      # 3. Install & Start ngrok Tunnel via Local API
       # ------------------------------------------------------------
-      - name: Download Pre-built bore Tunnel
+      - name: Start ngrok TCP Tunnel
         shell: pwsh
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          Write-Host "Downloading pre-compiled bore release via GitHub CLI..."
-          $binDir = Join-Path $env:USERPROFILE "bin"
-          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-
-          # Download binary archive instantly using the GitHub CLI
-          gh release download --repo ekzhang/bore --pattern "*x86_64-pc-windows-msvc.zip" --output "$binDir\bore.zip"
-          Expand-Archive -Path "$binDir\bore.zip" -DestinationPath $binDir -Force
-          Remove-Item "$binDir\bore.zip" -Force
-
-          $borePath = Join-Path $binDir "bore.exe"
-          if (-not (Test-Path $borePath)) {
-            Write-Error "Failed to locate bore.exe."
+          if (-not $env:NGROK_TOKEN) {
+            Write-Error "NGROK_AUTH_TOKEN secret is missing from repository settings."
             exit 1
           }
 
-          Write-Host "bore binary ready at: $borePath"
-          "BORE_EXE=$borePath" >> $env:GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ github.token }}
+          Write-Host "Installing ngrok..."
+          choco install ngrok -y --no-progress | Out-Null
 
-      # ------------------------------------------------------------
-      # 4. Start Tunnel and Maintain Connection
-      # ------------------------------------------------------------
-      - name: Start Tunnel and Maintain Connection
-        shell: pwsh
-        run: |
-          $borePath = $env:BORE_EXE
+          Write-Host "Configuring auth token..."
+          ngrok config add-authtoken $env:NGROK_TOKEN
 
-          Write-Host "Starting bore TCP tunnel on port 3389..."
-          $boreJob = Start-Process `
-            -FilePath $borePath `
-            -ArgumentList "local", "3389", "--to", "bore.pub" `
-            -RedirectStandardOutput "bore.log" `
-            -RedirectStandardError "bore-err.log" `
+          Write-Host "Starting ngrok tunnel on port 3389..."
+          $ngrokJob = Start-Process `
+            -FilePath "ngrok" `
+            -ArgumentList "tcp", "3389", "--log=stdout" `
+            -RedirectStandardOutput "ngrok.log" `
+            -RedirectStandardError "ngrok-err.log" `
             -PassThru
 
-          $boreAddress = $null
+          $ngrokAddress = $null
 
-          for ($retry = 1; $retry -le 25; $retry++) {
-            Start-Sleep -Seconds 1
+          # Poll ngrok's local REST API directly (port 4040)
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 2
 
-            foreach ($log in @("bore.log", "bore-err.log")) {
-              if (Test-Path $log) {
-                $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
-                if ($content -match "listening at ([\w\.\-]+:\d+)|bore\.pub[^\d]*(\d{4,5})") {
-                  $boreAddress = if ($matches[1]) { $matches[1] } else { "bore.pub:$($matches[2])" }
-                  break
-                }
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 2 -ErrorAction Stop
+              if ($response.tunnels -and $response.tunnels.Count -gt 0) {
+                # Format: tcp://0.tcp.ngrok.io:12345 -> 0.tcp.ngrok.io:12345
+                $ngrokAddress = $response.tunnels[0].public_url -replace "tcp://", ""
+                break
               }
+            } catch {
+              # API still coming up
             }
 
-            if ($boreAddress) { break }
-
-            if ($boreJob.HasExited) {
-              Write-Host "bore exited prematurely, restarting..."
-              $boreJob = Start-Process `
-                -FilePath $borePath `
-                -ArgumentList "local", "3389", "--to", "bore.pub" `
-                -RedirectStandardOutput "bore.log" `
-                -RedirectStandardError "bore-err.log" `
-                -PassThru
+            # If the process crashed, exit early
+            if ($ngrokJob.HasExited) {
+              Write-Host "ngrok process stopped unexpectedly."
+              break
             }
           }
 
-          if (-not $boreAddress) {
-            Write-Error "Could not retrieve bore tunnel address."
-            Get-Content "bore.log" -ErrorAction SilentlyContinue
-            Get-Content "bore-err.log" -ErrorAction SilentlyContinue
+          # Handle connection failures and print detailed logs
+          if (-not $ngrokAddress) {
+            Write-Error "Failed to retrieve ngrok public address."
+            Write-Host "`n--- NGROK LOG DUMP ---"
+            if (Test-Path "ngrok.log") { Get-Content "ngrok.log" | Write-Host }
+            if (Test-Path "ngrok-err.log") { Get-Content "ngrok-err.log" | Write-Host }
+            Write-Host "----------------------`n"
             exit 1
           }
 
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host "             RDP ACCESS READY"
+          Write-Host "             RDP READY"
           Write-Host "=========================================="
-          Write-Host "  Address:  $boreAddress"
+          Write-Host "  Address:  $ngrokAddress"
           Write-Host "  Username: $env:RDP_USERNAME"
           Write-Host "  Password: $env:RDP_PASSWORD"
           Write-Host "=========================================="
@@ -166,13 +150,13 @@ jobs:
 
           # Keep runner alive
           while ($true) {
-            if ($boreJob.HasExited) {
-              Write-Host "bore process stopped. Restarting..."
-              $boreJob = Start-Process `
-                -FilePath $borePath `
-                -ArgumentList "local", "3389", "--to", "bore.pub" `
-                -RedirectStandardOutput "bore.log" `
-                -RedirectStandardError "bore-err.log" `
+            if ($ngrokJob.HasExited) {
+              Write-Host "ngrok died. Restarting..."
+              $ngrokJob = Start-Process `
+                -FilePath "ngrok" `
+                -ArgumentList "tcp", "3389", "--log=stdout" `
+                -RedirectStandardOutput "ngrok.log" `
+                -RedirectStandardError "ngrok-err.log" `
                 -PassThru
             }
             Start-Sleep -Seconds 30
